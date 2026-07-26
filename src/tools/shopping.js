@@ -2,13 +2,6 @@ import { z } from "zod";
 import { textResponse, errorResponse } from "./helpers.js";
 import { createElicitationHelpers } from "./elicitation.js";
 
-// Default categories recognized by anylist.
-const valid_categories = ["baby","bakery","beverages","breakfast-and-cereal","condiments-oils-and-salad-dressings",
-  "cooking-and-baking","dairy","frozen-foods","grains-pasta-and-side-dishes",
-  "health-and-personal-care","household-and-cleaning","meat","pet-supplies",
-  "produce","seafood","snacks-cookies-and-candy","soups-and-canned-goods",
-  "wine-beer-spirits","other"];
-
   // TODO: What does this do?
 function buildDescription(stores) {
   const base = `Manage AnyList shopping lists and items. Actions:
@@ -19,7 +12,12 @@ function buildDescription(stores) {
 - delete_item: Permanently remove an item from a list
 - get_favorites: Get favorite items for a list
 - get_recents: Get recently added items for a list
-- list_stores: list stores available for the list (if any)`;
+- list_stores: list stores available for the list (if any)
+- list_categories: Show the categories defined on a list
+- create_category: Create a new custom category on a list
+- rename_category: Rename an existing category
+- delete_category: Delete a category from a list
+- set_item_category: Move an existing item into a category`;
   if (!stores || stores.length === 0) return base;
   const storeList = stores.map(s => s.name).join(', ');
   return `${base}\n\nAvailable stores: ${storeList}`;
@@ -62,22 +60,21 @@ export function register(server, getClient) {
     title: "Shopping Lists & Items",
     description: buildDescription([]),
     inputSchema: {
-      action: z.enum(["list_lists", "list_items", "add_item", 
-        "set_item_store", "check_item", "delete_item", "get_favorites", "get_recents", "list_stores"]).describe("The shopping action to perform"),
+      action: z.enum(["list_lists", "list_items", "add_item",
+        "set_item_store", "check_item", "delete_item", "get_favorites", "get_recents", "list_stores",
+        "list_categories", "create_category", "rename_category", "delete_category", "set_item_category"]).describe("The shopping action to perform"),
       list_name: z.string().optional().describe("Name of the list (defaults to configured default list)"),
       name: z.string().optional().describe("Item name (required for add_item, set_item_store, check_item, delete_item)"),
       quantity: z.number().min(1).optional().describe("Item quantity (add_item only, defaults to 1)"),
       notes: z.string().optional().describe("Notes for the item (add_item only)"),
       include_checked: z.boolean().optional().describe("Include checked-off items (list_items only, default false)"),
       include_notes: z.boolean().optional().describe("Include notes for each item (list_items only, default false)"),
-      category: z.enum(valid_categories).optional().describe("Category for the item (add_item only, defaults to 'other')"),
+      category: z.string().optional().describe("Category name, matched against the list's own categories (add_item, set_item_category, create_category, rename_category, delete_category). Use list_categories to see what a list has."),
+      new_name: z.string().optional().describe("New category name (rename_category only)"),
       store_name: z.string().optional().describe("Store to assign to this item (add_item and set_item_store only; omit or leave blank to clear)"),
     }
   }, async (params) => {
-    const { action, list_name, name, quantity, notes, include_checked, include_notes, category } = params;
-    if (category && !valid_categories.includes(category)) {
-      throw new Error(`Invalid input for field "category": "${category}". Valid categories are: ${valid_categories.join(", ")}`);
-    }
+    const { action, list_name, name, quantity, notes, include_checked, include_notes, category, new_name } = params;
     try {
       const client = await getClient();
       switch (action) {
@@ -182,6 +179,46 @@ export function register(server, getClient) {
           if (stores.length === 0) return textResponse(`No stores found for list "${client.targetList.name}".`);
           const list = stores.map(s => `- ${s.name}`).join('\n');
           return textResponse(`Stores for "${client.targetList.name}" (${stores.length}):\n${list}`);
+        }
+        case "list_categories": {
+          await client.connect(list_name || null);
+          const categories = client.getCategories();
+          if (categories.length === 0) return textResponse(`No categories found for list "${client.targetList.name}".`);
+          const list = categories.map(c => `- ${c.name}${c.systemCategory ? '' : ' (custom)'}`).join('\n');
+          return textResponse(`Categories for "${client.targetList.name}" (${categories.length}):\n${list}`);
+        }
+        case "create_category": {
+          let categoryName = category;
+          if (!categoryName) categoryName = await elicitRequiredField("category", "What should the new category be called?");
+          await client.connect(list_name);
+          const created = await client.createCategory(categoryName);
+          return textResponse(`Successfully created category "${created.name}" on list "${client.targetList.name}"`);
+        }
+        case "rename_category": {
+          let categoryName = category;
+          if (!categoryName) categoryName = await elicitRequiredField("category", "Which category would you like to rename?");
+          let renamedTo = new_name;
+          if (!renamedTo) renamedTo = await elicitRequiredField("new_name", `What should "${categoryName}" be renamed to?`);
+          await client.connect(list_name);
+          const renamed = await client.renameCategory(categoryName, renamedTo);
+          return textResponse(`Successfully renamed category "${categoryName}" to "${renamed.name}" on list "${client.targetList.name}"`);
+        }
+        case "delete_category": {
+          let categoryName = category;
+          if (!categoryName) categoryName = await elicitRequiredField("category", "Which category would you like to delete?");
+          await client.connect(list_name);
+          await client.deleteCategory(categoryName);
+          return textResponse(`Successfully deleted category "${categoryName}" from list "${client.targetList.name}"`);
+        }
+        case "set_item_category": {
+          let itemName = name;
+          if (!itemName) itemName = await elicitRequiredField("name", "Which item would you like to categorize?");
+          let categoryName = category;
+          if (!categoryName) categoryName = await elicitRequiredField("category", `Which category should "${itemName}" go in?`);
+          await client.connect(list_name);
+          const resolvedItem = await resolveItemName(client, itemName);
+          await client.setItemCategory(resolvedItem, categoryName);
+          return textResponse(`Successfully moved "${resolvedItem}" to category "${categoryName}" on list "${client.targetList.name}"`);
         }
       }
     } catch (error) {

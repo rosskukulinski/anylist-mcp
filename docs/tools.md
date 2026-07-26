@@ -32,7 +32,8 @@ Manage shopping lists and items.
 | `include_checked` | boolean | No | Include checked-off items (list_items only) |
 | `include_notes` | boolean | No | Include item notes in output (list_items only) |
 | `store_name` | string | No | Filter items by store (add_items, set_item_category only) |
-| `category` | string | No | Category for item (add_item only) |
+| `category` | string | No | Category name (add_item, set_item_category, create_category, rename_category, delete_category) |
+| `new_name` | string | For rename_category | New category name |
 
 **Actions:**
 
@@ -61,8 +62,32 @@ Manage shopping lists and items.
 // Set store for an item
 { "name": "shopping", "arguments": { "action": "set_item_store", "name": "Milk", "store_name": "Costco" } }
 
+// List the categories defined on a list
+{ "name": "shopping", "arguments": { "action": "list_categories" } }
+
+// Create a custom category
+{ "name": "shopping", "arguments": { "action": "create_category", "category": "Hannah" } }
+
+// Rename a category
+{ "name": "shopping", "arguments": { "action": "rename_category", "category": "Hannah", "new_name": "Hannah's Snacks" } }
+
+// Delete a category
+{ "name": "shopping", "arguments": { "action": "delete_category", "category": "Hannah" } }
+
 // Set category for an item
+{ "name": "shopping", "arguments": { "action": "set_item_category", "name": "Milk", "category": "Hannah" } }
 ```
+
+### Categories
+
+`category` accepts any category that exists on the target list, matched case-insensitively
+by name — including custom categories you created in the AnyList app. AnyList's built-in
+category ids (`produce`, `snacks-cookies-and-candy`, …) are still accepted.
+
+A category that the list doesn't have is rejected with the list of available categories
+rather than created implicitly; use `create_category` first. On `add_item`, the category
+is applied only when the item is newly created — an item that already exists keeps its
+current category, so use `set_item_category` to move it.
 
 ---
 
