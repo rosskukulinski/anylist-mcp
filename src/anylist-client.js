@@ -1,26 +1,50 @@
 import AnyList from '../anylist-js/lib/index.js';
+import Item from '../anylist-js/lib/item.js';
+import { normalizeRecipe } from './recipe-normalizer.js';
+
+// Patch Item._encode to not include 'quantity' field which doesn't exist in protobuf schema
+Item.prototype._encode = function() {
+  return new this._protobuf.ListItem({
+    identifier: this._identifier,
+    listId: this._listId,
+    name: this._name,
+    details: this._details,
+    checked: this._checked,
+    category: this._category,
+    userId: this._userId,
+    categoryMatchId: this._categoryMatchId,
+    manualSortIndex: this._manualSortIndex,
+    storeIds: this._storeIds || [],
+  });
+};
 
 class AnyListClient {
-  constructor() {
+  /**
+   * @param {{ username?: string, password?: string, defaultListName?: string }} [credentials]
+   *   Optional credentials. Falls back to ANYLIST_USERNAME / ANYLIST_PASSWORD / ANYLIST_LIST_NAME
+   *   environment variables when not provided (stdio mode).
+   */
+  constructor({ username, password, defaultListName } = {}) {
     this.client = null;
     this.targetList = null;
+    this._username = username || null;
+    this._password = password || null;
+    this.defaultListName = defaultListName || null;
   }
 
-  
-
   async connect(listName = null) {
-    const username = process.env.ANYLIST_USERNAME;
-    const password = process.env.ANYLIST_PASSWORD;
-    const targetListName = listName || process.env.ANYLIST_LIST_NAME;
+    const username = this._username || process.env.ANYLIST_USERNAME;
+    const password = this._password || process.env.ANYLIST_PASSWORD;
+    const targetListName = listName || this.defaultListName || process.env.ANYLIST_LIST_NAME;
 
     if (!username || !password) {
-      const error = new Error('Missing required environment variables: ANYLIST_USERNAME or ANYLIST_PASSWORD');
+      const error = new Error('Missing AnyList credentials. Provide username and password.');
       console.error(error.message);
       throw error;
     }
 
     if (!targetListName) {
-      const error = new Error('No list name provided and ANYLIST_LIST_NAME environment variable is not set');
+      const error = new Error('No list name provided and no default list configured');
       console.error(error.message);
       throw error;
     }
@@ -76,12 +100,12 @@ class AnyListClient {
     if (!this.client || !this.client.lists) return [];
     return this.client.lists.map(list => ({
       name: list.name,
-      itemCount: list.items ? list.items.length : 0
+      uncheckedCount: list.items ? list.items.filter(item => !item.checked).length : 0
     }));
   }
 
   // TODO: Update quantity
-  async addItem(itemName, quantity = 1) {
+  async addItem(itemName, quantity = 1, notes = null, category = "other", store = null) {
     if (!this.targetList) {
       const error = new Error('Not connected to any list. Call connect() first.');
       console.error(error.message);
@@ -91,33 +115,61 @@ class AnyListClient {
     try {
       // First, check if item already exists
       const existingItem = this.targetList.getItemByName(itemName);
-      
+
       if (existingItem) {
         // Item exists - check if it's checked (completed)
+
         if (existingItem.checked) {
           // Uncheck the item to make it active again
           existingItem.checked = false;
           existingItem.quantity = quantity; // Update quantity if needed
+          if (notes !== null) {
+            existingItem.details = notes;
+          }
 
           console.error(`Unchecked existing item: ${existingItem.name}`);
           existingItem.save();
         } else {
-          
+
           // Item already exists and is unchecked, no action needed
           console.error(`Item "${itemName}" already exists and is active`);
           existingItem.quantity = quantity;
-          
+          if (notes !== null) {
+            existingItem.details = notes;
+          }
+          // Category not used if item already has a category
+
           existingItem.save();
         }
       } else {
         // Item doesn't exist, create new one
+        const itemOptions = { name: itemName };
+        if (notes !== null) {
+          itemOptions.details = notes;
+        }
+        if (category !== "other") {
+          itemOptions.categoryMatchId = category;
+        }
 
-
-        const newItem = this.client.createItem({
-          name: itemName
-        });
+        const newItem = this.client.createItem(itemOptions);
         await this.targetList.addItem(newItem);
+
+        // Set quantity and notes after adding (can't be done via _encode)
+        if (quantity !== 1 || notes !== null) {
+          if (quantity !== 1) {
+            newItem.quantity = quantity;
+          }
+          if (notes !== null) {
+            newItem.details = notes;
+          }
+          await newItem.save();
+        }
+
         console.error(`Added new item: ${newItem.name}`);
+      }
+
+      if (store) {
+        await this.setItemStore(itemName, store);
       }
 
     } catch (error) {
@@ -127,7 +179,6 @@ class AnyListClient {
     }
   }
 
-  // Currently buggy and doesn't work as expected
   async deleteItem(itemName) {
     if (!this.targetList) {
       const error = new Error('Not connected to any list. Call connect() first.');
@@ -136,19 +187,15 @@ class AnyListClient {
     }
 
     try {
-      // Find the item by name
       const existingItem = this.targetList.getItemByName(itemName);
 
-      console.error("Found item")
-      
       if (!existingItem) {
         const error = new Error(`Item "${itemName}" not found in list, so can't delete it`);
         console.error(error.message);
         throw error;
       }
 
-      // Actually delete the item from the list
-      await this.targetList.removeItem({ id: existingItem.id });
+      await this.targetList.removeItem(existingItem);
       console.error(`Deleted item: ${existingItem.name}`);
 
     } catch (error) {
@@ -198,9 +245,6 @@ class AnyListClient {
     }
 
     try {
-      // Build category ID to name map from the response data
-      const categoryMap = this._buildCategoryMap();
-
       // Get all items from the list
       const items = this.targetList.items || [];
 
@@ -215,11 +259,14 @@ class AnyListClient {
           name: item.name,
           quantity: typeof item.quantity === 'number' ? item.quantity : 1,
           checked: item.checked || false,
-          category: categoryMap[item.categoryMatchId] || 'other'
+          category: item.categoryMatchId || 'other'
         };
-        if (includeNotes && item.note) {
-          result.note = item.note;
+        if (includeNotes && item.details) {
+          result.note = item.details;
         }
+        const store = (this.targetList.stores || []).find(s => s.identifier === item.storeIds[0]);
+        result.store = store ? store.name : null;
+        
         return result;
       });
     } catch (error) {
@@ -249,6 +296,438 @@ class AnyListClient {
       console.error(`Failed to build category map: ${error.message}`);
     }
     return categoryMap;
+  }
+
+  // ===== STORES =====
+
+  getStores() {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    return this.targetList.stores || [];
+  }
+
+  async setItemStore(itemName, storeName) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    const item = this.targetList.getItemByName(itemName);
+    if (!item) {
+      throw new Error(`Item "${itemName}" not found in list`);
+    }
+    let storeIds = [];
+    if (storeName) {
+      const store = this.targetList.findStoreByName(storeName);
+      if (!store) {
+        const available = (this.targetList.stores || []).map(s => s.name).join(', ') || 'none';
+        throw new Error(`Store "${storeName}" not found. Available stores: ${available}`);
+      }
+      storeIds = [store.identifier];
+    }
+    await item.setStores(storeIds);
+  }
+
+  async createStore(storeName) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    try {
+      const store = await this.targetList.createStore(storeName);
+      console.error(`Created store: ${store.name}`);
+      return store;
+    } catch (error) {
+      throw new Error(`Failed to create store "${storeName}": ${error.message}`);
+    }
+  }
+
+  async deleteStore(storeName) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    const store = this.targetList.findStoreByName(storeName);
+    if (!store) {
+      throw new Error(`Store "${storeName}" not found`);
+    }
+    try {
+      await this.targetList.deleteStore(store.identifier);
+      console.error(`Deleted store: ${storeName}`);
+    } catch (error) {
+      throw new Error(`Failed to delete store "${storeName}": ${error.message}`);
+    }
+  }
+
+  // ===== RECIPES =====
+
+  async getRecipes(searchQuery = null) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      const recipes = await this.client.getRecipes();
+      let results = recipes.map(r => ({
+        identifier: r.identifier,
+        name: r.name,
+        note: r.note || null,
+        sourceName: r.sourceName || null,
+        sourceUrl: r.sourceUrl || null,
+        rating: r.rating || null,
+        prepTime: r.prepTime || null,
+        cookTime: r.cookTime || null,
+        servings: r.servings || null,
+        ingredientCount: r.ingredients ? r.ingredients.length : 0,
+        stepCount: r.preparationSteps ? r.preparationSteps.length : 0,
+      }));
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase();
+        results = results.filter(r => r.name && r.name.toLowerCase().includes(q));
+      }
+      return results;
+    } catch (error) {
+      throw new Error(`Failed to get recipes: ${error.message}`);
+    }
+  }
+
+  async getRecipeDetails(recipeName) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      const recipes = await this.client.getRecipes();
+      const recipe = recipes.find(r => r.name && r.name.toLowerCase() === recipeName.toLowerCase());
+      if (!recipe) {
+        throw new Error(`Recipe "${recipeName}" not found`);
+      }
+      return {
+        identifier: recipe.identifier,
+        name: recipe.name,
+        note: recipe.note || null,
+        sourceName: recipe.sourceName || null,
+        sourceUrl: recipe.sourceUrl || null,
+        rating: recipe.rating || null,
+        prepTime: recipe.prepTime || null,
+        cookTime: recipe.cookTime || null,
+        servings: recipe.servings || null,
+        nutritionalInfo: recipe.nutritionalInfo || null,
+        createdAt: recipe.creationTimestamp
+          ? new Date(recipe.creationTimestamp * 1000).toISOString()
+          : (recipe.timestamp ? new Date(recipe.timestamp * 1000).toISOString() : null),
+        ingredients: recipe.ingredients ? recipe.ingredients.map(i => ({
+          rawIngredient: i.rawIngredient || null,
+          name: i.name || null,
+          quantity: i.quantity || null,
+          note: i.note || null,
+        })) : [],
+        preparationSteps: recipe.preparationSteps || [],
+      };
+    } catch (error) {
+      throw new Error(`Failed to get recipe details: ${error.message}`);
+    }
+  }
+
+  async importRecipeFromUrl(url) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+
+    // Try AnyList's native web import first
+    let nativeError = null;
+    try {
+      const result = await this.client.client.post('data/recipes/web-import?url=' + encodeURIComponent(url));
+      const decoded = this.client.protobuf.PBRecipeWebImportResponse.decode(result.body);
+
+      if (decoded.statusCode === 0 && decoded.recipe) {
+        // Native import succeeded
+        const recipe = await this.client.createRecipe({
+          name: decoded.recipe.name,
+          note: decoded.recipe.note || null,
+          sourceName: decoded.recipe.sourceName || null,
+          sourceUrl: decoded.recipe.sourceUrl || url,
+          prepTime: decoded.recipe.prepTime || null,
+          cookTime: decoded.recipe.cookTime || null,
+          servings: decoded.recipe.servings || null,
+          nutritionalInfo: decoded.recipe.nutritionalInfo || null,
+          rating: decoded.recipe.rating || null,
+          ingredients: decoded.recipe.ingredients || [],
+          preparationSteps: decoded.recipe.preparationSteps || [],
+        });
+        recipe.isNewRecipeFromWebImport = true;
+        recipe.creationTimestamp = Date.now() / 1000;
+        await recipe.save();
+        console.error(`Imported recipe from URL (native): ${recipe.name}`);
+
+        return {
+          name: recipe.name,
+          identifier: recipe.identifier,
+          ingredientCount: decoded.recipe.ingredients?.length || 0,
+          stepCount: decoded.recipe.preparationSteps?.length || 0,
+          source: decoded.recipe.sourceName || null,
+          sourceUrl: decoded.recipe.sourceUrl || url,
+          isPremiumUser: decoded.isPremiumUser,
+          freeImportsRemaining: decoded.freeRecipeImportsRemainingCount,
+          method: 'native',
+        };
+      }
+      nativeError = decoded.siteSpecificHelpText || 'Native import returned no recipe';
+    } catch (error) {
+      nativeError = error.message;
+    }
+
+    // Fallback: use normalizer
+    console.error(`Native import failed (${nativeError}), trying normalizer fallback...`);
+    try {
+      const normalized = await normalizeRecipe({ url });
+      const created = await this.createRecipe({
+        name: normalized.name,
+        ingredients: normalized.ingredients,
+        preparationSteps: normalized.preparationSteps,
+        note: normalized.note,
+        sourceName: normalized.sourceName,
+        sourceUrl: normalized.sourceUrl || url,
+        prepTime: normalized.prepTime,
+        cookTime: normalized.cookTime,
+        servings: normalized.servings,
+      });
+      console.error(`Imported recipe from URL (normalizer fallback): ${created.name}`);
+
+      return {
+        name: created.name,
+        identifier: created.identifier,
+        ingredientCount: normalized.ingredients.length,
+        stepCount: normalized.preparationSteps.length,
+        source: normalized.sourceName || null,
+        sourceUrl: normalized.sourceUrl || url,
+        method: 'normalizer',
+      };
+    } catch (fallbackError) {
+      throw new Error(`Failed to import recipe from URL: native import failed (${nativeError}), normalizer also failed (${fallbackError.message})`);
+    }
+  }
+
+  async createRecipe({ name, ingredients = [], preparationSteps = [], note = null, sourceName = null, sourceUrl = null, prepTime = null, cookTime = null, servings = null }) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      const nowSecs = Date.now() / 1000;
+      const recipeObj = { name, creationTimestamp: nowSecs };
+      if (note) recipeObj.note = note;
+      if (sourceName) recipeObj.sourceName = sourceName;
+      if (sourceUrl) recipeObj.sourceUrl = sourceUrl;
+      if (prepTime) recipeObj.prepTime = prepTime;
+      if (cookTime) recipeObj.cookTime = cookTime;
+      if (servings) recipeObj.servings = servings;
+      if (preparationSteps.length > 0) recipeObj.preparationSteps = preparationSteps;
+      if (ingredients.length > 0) {
+        recipeObj.ingredients = ingredients.map(i => ({
+          rawIngredient: typeof i === 'string' ? i : i.rawIngredient || `${i.quantity || ''} ${i.name || ''}`.trim(),
+          name: typeof i === 'string' ? i : (i.name || i.rawIngredient || null),
+          quantity: typeof i === 'string' ? null : i.quantity || null,
+          note: typeof i === 'string' ? null : i.note || null,
+        }));
+      }
+      const recipe = await this.client.createRecipe(recipeObj);
+      await recipe.save();
+      console.error(`Created recipe: ${recipe.name}`);
+      return { identifier: recipe.identifier, name: recipe.name };
+    } catch (error) {
+      throw new Error(`Failed to create recipe: ${error.message}`);
+    }
+  }
+
+  async deleteRecipe(recipeName) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      const recipes = await this.client.getRecipes();
+      const recipe = recipes.find(r => r.name && r.name.toLowerCase() === recipeName.toLowerCase());
+      if (!recipe) {
+        throw new Error(`Recipe "${recipeName}" not found`);
+      }
+      await recipe.delete();
+      console.error(`Deleted recipe: ${recipe.name}`);
+    } catch (error) {
+      throw new Error(`Failed to delete recipe: ${error.message}`);
+    }
+  }
+
+  // ===== MEAL PLANNING =====
+
+  async getMealPlanEvents() {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      const events = await this.client.getMealPlanningCalendarEvents();
+      return events.map(e => ({
+        identifier: e.identifier,
+        date: e.date instanceof Date ? e.date.toISOString().slice(0, 10) : String(e.date),
+        title: e.title || null,
+        details: e.details || null,
+        labelName: e.label ? e.label.name : null,
+        labelColor: e.label ? e.label.hexColor : null,
+        recipeName: e.recipe ? e.recipe.name : null,
+        recipeId: e.recipeId || null,
+      }));
+    } catch (error) {
+      throw new Error(`Failed to get meal plan events: ${error.message}`);
+    }
+  }
+
+  async getMealPlanLabels() {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      await this.client.getMealPlanningCalendarEvents();
+      return (this.client.mealPlanningCalendarEventLabels || []).map(l => ({
+        identifier: l.identifier,
+        name: l.name,
+        hexColor: l.hexColor,
+        sortIndex: l.sortIndex,
+      }));
+    } catch (error) {
+      throw new Error(`Failed to get meal plan labels: ${error.message}`);
+    }
+  }
+
+  async createMealPlanEvent({ date, title = null, recipeId = null, labelId = null, details = null }) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      const eventObj = { date: new Date(`${date}T12:00:00`) };
+      if (title) eventObj.title = title;
+      if (recipeId) eventObj.recipeId = recipeId;
+      if (labelId) eventObj.labelId = labelId;
+      if (details) eventObj.details = details;
+      const event = await this.client.createEvent(eventObj);
+      await event.save();
+      console.error(`Created meal plan event for ${date}`);
+      return { identifier: event.identifier, date: date };
+    } catch (error) {
+      throw new Error(`Failed to create meal plan event: ${error.message}`);
+    }
+  }
+
+  async deleteMealPlanEvent(eventId) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      const events = await this.client.getMealPlanningCalendarEvents();
+      const event = events.find(e => e.identifier === eventId);
+      if (!event) {
+        throw new Error(`Meal plan event "${eventId}" not found`);
+      }
+      await event.delete();
+      console.error(`Deleted meal plan event: ${eventId}`);
+    } catch (error) {
+      throw new Error(`Failed to delete meal plan event: ${error.message}`);
+    }
+  }
+
+  // ===== FAVORITES & RECENTS =====
+
+  async getFavoriteItems(listName) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      await this.connect(listName);
+      const favList = this.client.getFavoriteItemsByListId(this.targetList.identifier);
+      if (!favList || !favList.items) {
+        return [];
+      }
+      return favList.items.map(i => ({
+        name: i.name,
+        details: i.details || null,
+      }));
+    } catch (error) {
+      throw new Error(`Failed to get favorite items: ${error.message}`);
+    }
+  }
+
+  async getRecentItems(listName) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      await this.connect(listName);
+      const items = this.client.getRecentItemsByListId(this.targetList.identifier);
+      if (!items) {
+        return [];
+      }
+      return items.map(i => ({
+        name: i.name,
+        details: i.details || null,
+      }));
+    } catch (error) {
+      throw new Error(`Failed to get recent items: ${error.message}`);
+    }
+  }
+
+  // ===== RECIPE COLLECTIONS =====
+
+  async getRecipeCollections() {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      const userData = await this.client._getUserData(true);
+      const collections = userData.recipeDataResponse.recipeCollections || [];
+      const recipes = await this.client.getRecipes();
+      return collections.map(c => ({
+        identifier: c.identifier,
+        name: c.name,
+        recipeCount: c.recipeIds ? c.recipeIds.length : 0,
+        recipeNames: (c.recipeIds || []).map(id => {
+          const r = recipes.find(r => r.identifier === id);
+          return r ? r.name : id;
+        }),
+      }));
+    } catch (error) {
+      throw new Error(`Failed to get recipe collections: ${error.message}`);
+    }
+  }
+
+  async createRecipeCollection(name, recipeNames = []) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      const recipeIds = [];
+      if (recipeNames.length > 0) {
+        const recipes = await this.client.getRecipes();
+        for (const rName of recipeNames) {
+          const r = recipes.find(r => r.name && r.name.toLowerCase() === rName.toLowerCase());
+          if (r) recipeIds.push(r.identifier);
+        }
+      }
+      const collection = this.client.createRecipeCollection({ name, recipeIds });
+      await collection.save();
+      console.error(`Created recipe collection: ${name}`);
+      return { identifier: collection.identifier, name: collection.name };
+    } catch (error) {
+      throw new Error(`Failed to create recipe collection: ${error.message}`);
+    }
+  }
+
+  async deleteRecipeCollection(name) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      const userData = await this.client._getUserData(true);
+      const collections = userData.recipeDataResponse.recipeCollections || [];
+      const raw = collections.find(c => c.name && c.name.toLowerCase() === name.toLowerCase());
+      if (!raw) throw new Error(`Recipe collection "${name}" not found`);
+      const collection = this.client.createRecipeCollection(raw);
+      await collection.delete();
+      console.error(`Deleted recipe collection: ${name}`);
+    } catch (error) {
+      throw new Error(`Failed to delete recipe collection: ${error.message}`);
+    }
   }
 
   async disconnect() {

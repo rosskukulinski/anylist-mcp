@@ -17,3 +17,13 @@ yarn-debug.log
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# generated mcpb files
+*.mcpb
+
+# HTTP server data (SQLite DB, credentials)
+/data/
+
+# Config directory with real allowed emails (copy of example with real emails)
+/config/
+allowed-emails.txt
