@@ -13,10 +13,24 @@ Item.prototype._encode = function() {
     category: this._category,
     userId: this._userId,
     categoryMatchId: this._categoryMatchId,
+    categoryAssignments: this._categoryAssignments || [],
     manualSortIndex: this._manualSortIndex,
     storeIds: this._storeIds || [],
   });
 };
+
+/**
+ * AnyList's grouping/display key for a category. Custom categories have no
+ * systemCategory, so fall back to a slug of the name.
+ */
+function categoryMatchId(category) {
+  if (category.systemCategory) return category.systemCategory;
+  return String(category.name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
 
 class AnyListClient {
   /**
@@ -147,9 +161,6 @@ class AnyListClient {
         if (notes !== null) {
           itemOptions.details = notes;
         }
-        if (category !== "other") {
-          itemOptions.categoryMatchId = category;
-        }
 
         const newItem = this.client.createItem(itemOptions);
         await this.targetList.addItem(newItem);
@@ -163,6 +174,12 @@ class AnyListClient {
             newItem.details = notes;
           }
           await newItem.save();
+        }
+
+        // Assigned after saving: assignToCustomCategory posts the whole item,
+        // so a later save() would replay a stale category op over it.
+        if (category && category !== "other") {
+          await this._assignCategory(newItem, category);
         }
 
         console.error(`Added new item: ${newItem.name}`);
@@ -259,7 +276,7 @@ class AnyListClient {
           name: item.name,
           quantity: typeof item.quantity === 'number' ? item.quantity : 1,
           checked: item.checked || false,
-          category: item.categoryMatchId || 'other'
+          category: this._categoryNameForItem(item)
         };
         if (includeNotes && item.details) {
           result.note = item.details;
@@ -274,6 +291,137 @@ class AnyListClient {
       console.error(wrappedError.message);
       throw wrappedError;
     }
+  }
+
+  // ===== CATEGORIES =====
+
+  /**
+   * Every category defined on the connected list, across all of its category
+   * groups. Custom categories have systemCategory === null.
+   */
+  getCategories() {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    return (this.targetList.categoryGroups || []).flatMap(group =>
+      (group.categories || []).map(category => ({
+        name: category.name,
+        identifier: category.identifier,
+        icon: category.icon || null,
+        systemCategory: category.systemCategory || null,
+        groupId: group.identifier,
+        groupName: group.name || null,
+      }))
+    );
+  }
+
+  async createCategory(categoryName, icon = null) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    if (this._findCategory(categoryName)) {
+      throw new Error(`Category "${categoryName}" already exists in list "${this.targetList.name}"`);
+    }
+    try {
+      const category = await this.targetList.createCategory({
+        name: categoryName,
+        ...(icon ? { icon } : {}),
+      });
+      console.error(`Created category: ${category.name}`);
+      return category;
+    } catch (error) {
+      throw new Error(`Failed to create category "${categoryName}": ${error.message}`);
+    }
+  }
+
+  async renameCategory(currentName, newName) {
+    const { category } = this._requireCategory(currentName);
+    try {
+      const updated = await this.targetList.renameCategory(category.identifier, newName);
+      console.error(`Renamed category "${currentName}" to "${updated.name}"`);
+      return updated;
+    } catch (error) {
+      throw new Error(`Failed to rename category "${currentName}": ${error.message}`);
+    }
+  }
+
+  async deleteCategory(categoryName) {
+    const { category } = this._requireCategory(categoryName);
+    try {
+      await this.targetList.removeCategory(category.identifier);
+      console.error(`Deleted category: ${category.name}`);
+    } catch (error) {
+      throw new Error(`Failed to delete category "${categoryName}": ${error.message}`);
+    }
+  }
+
+  async setItemCategory(itemName, categoryName) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    const item = this.targetList.getItemByName(itemName);
+    if (!item) {
+      throw new Error(`Item "${itemName}" not found in list`);
+    }
+    await this._assignCategory(item, categoryName);
+  }
+
+  /**
+   * Match a category on the connected list by name (case-insensitive) or by
+   * system category id, so both "Snacks" and "snacks-cookies-and-candy" work.
+   */
+  _findCategory(categoryName) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    const byName = this.targetList.findCategoryByName(categoryName);
+    if (byName) return byName;
+
+    const wanted = String(categoryName || '').trim().toLowerCase();
+    for (const group of this.targetList.categoryGroups || []) {
+      const category = (group.categories || []).find(
+        c => c.systemCategory && c.systemCategory.toLowerCase() === wanted
+      );
+      if (category) return { group, category };
+    }
+    return null;
+  }
+
+  _requireCategory(categoryName) {
+    const found = this._findCategory(categoryName);
+    if (found) return found;
+    const available = this.getCategories().map(c => c.name).join(', ') || 'none';
+    throw new Error(
+      `Category "${categoryName}" not found in list "${this.targetList.name}". ` +
+      `Available categories: ${available}. Create it first with the create_category action.`
+    );
+  }
+
+  async _assignCategory(item, categoryName) {
+    // Lists that have never been customized carry no category groups; fall back
+    // to the plain match id, which is what this server sent before custom
+    // categories were supported.
+    if ((this.targetList.categoryGroups || []).length === 0) {
+      item.categoryMatchId = categoryMatchId({ name: categoryName });
+      await item.save();
+      return;
+    }
+
+    const { group, category } = this._requireCategory(categoryName);
+    await item.assignToCustomCategory({
+      categoryGroupId: group.identifier,
+      categoryId: category.identifier,
+      matchId: categoryMatchId(category),
+    });
+  }
+
+  _categoryNameForItem(item) {
+    const assignment = (item.categoryAssignments || [])[0];
+    if (assignment && this.targetList.findCategory) {
+      const found = this.targetList.findCategory(assignment.categoryId);
+      if (found) return found.category.name;
+    }
+    return item.categoryMatchId || 'other';
   }
 
   _buildCategoryMap() {

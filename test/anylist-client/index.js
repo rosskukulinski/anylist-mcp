@@ -1,5 +1,6 @@
 import { runShoppingListsTests } from './shopping-lists.test.js';
 import { runShoppingItemsTests } from './shopping-items.test.js';
+import { runCategoriesTests } from './categories.test.js';
 import { runRecipesTests } from './recipes.test.js';
 import { runCollectionsTests } from './collections.test.js';
 import { runMealPlanTests } from './meal-plan.test.js';
@@ -9,6 +10,7 @@ console.log('🧪 AnyList Client Tests\n');
 const suites = [
   runShoppingListsTests,
   runShoppingItemsTests,
+  runCategoriesTests,
   runRecipesTests,
   runCollectionsTests,
   runMealPlanTests,

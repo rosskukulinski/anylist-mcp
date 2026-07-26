@@ -39,6 +39,7 @@ export class MockAnyListClient {
     this._collections = [];
     this._pendingImport = null;
     this._stores = [];
+    this._categories = [];
   }
 
   reset() {
@@ -55,6 +56,7 @@ export class MockAnyListClient {
     this._collections = [];
     this._pendingImport = null;
     this._stores = [];
+    this._categories = [];
   }
 
   async connect(listName = null) {
@@ -75,7 +77,8 @@ export class MockAnyListClient {
   getStores() { return this._stores || []; }
 
   async addItem(name, qty, notes, category, store = null) {
-    this._items.push({ name, quantity: qty, notes, category, store });
+    const resolved = category && category !== 'other' ? this._requireCategory(category).name : category;
+    this._items.push({ name, quantity: qty, notes, category: resolved, store });
   }
 
   async removeItem(name) {
@@ -107,6 +110,49 @@ export class MockAnyListClient {
     const item = this._items.find(i => i.name === name);
     if (!item) throw new Error(`Item "${name}" not found in list`);
     item.store = store || null;
+  }
+
+  getCategories() { return [...this._categories]; }
+
+  _findCategory(name) {
+    return this._categories.find(c => c.name.toLowerCase() === String(name).trim().toLowerCase())
+      || this._categories.find(c => c.systemCategory === String(name).trim().toLowerCase())
+      || null;
+  }
+
+  _requireCategory(name) {
+    const category = this._findCategory(name);
+    if (!category) {
+      const available = this._categories.map(c => c.name).join(', ') || 'none';
+      throw new Error(`Category "${name}" not found in list "${this.targetList.name}". Available categories: ${available}. Create it first with the create_category action.`);
+    }
+    return category;
+  }
+
+  async createCategory(name) {
+    if (this._findCategory(name)) {
+      throw new Error(`Category "${name}" already exists in list "${this.targetList.name}"`);
+    }
+    const category = { name, identifier: `cat-${this._categories.length + 1}`, systemCategory: null };
+    this._categories.push(category);
+    return category;
+  }
+
+  async renameCategory(currentName, newName) {
+    const category = this._requireCategory(currentName);
+    category.name = newName;
+    return category;
+  }
+
+  async deleteCategory(name) {
+    const category = this._requireCategory(name);
+    this._categories = this._categories.filter(c => c !== category);
+  }
+
+  async setItemCategory(itemName, categoryName) {
+    const item = this._items.find(i => i.name === itemName);
+    if (!item) throw new Error(`Item "${itemName}" not found in list`);
+    item.category = this._requireCategory(categoryName).name;
   }
 
   async getFavoriteItems() { return this._favorites; }
