@@ -98,11 +98,7 @@ class AnyListClient {
       this._password ||
       (await readFromKeyring('password')) ||
       process.env.ANYLIST_PASSWORD;
-    const targetListName =
-      listName ||
-      this.defaultListName ||
-      (await readFromKeyring('defaultListName')) ||
-      process.env.ANYLIST_LIST_NAME;
+    const targetListName = listName || (await this.getConfiguredDefaultListName());
 
     if (!username || !password) {
       const error = new Error(
@@ -158,6 +154,22 @@ class AnyListClient {
       console.error(wrappedError.message);
       throw wrappedError;
     }
+  }
+
+  /**
+   * The default list configured for this server, resolved without connecting.
+   * Mirrors connect()'s order: constructor value, then the keychain
+   * "default-list" entry, then ANYLIST_LIST_NAME.
+   *
+   * @returns {Promise<string|null>}
+   */
+  async getConfiguredDefaultListName() {
+    return (
+      this.defaultListName ||
+      (await readFromKeyring('defaultListName')) ||
+      process.env.ANYLIST_LIST_NAME ||
+      null
+    );
   }
 
   getAvailableListNames() {
@@ -276,15 +288,6 @@ class AnyListClient {
     }
     const { group, category } = found;
 
-    // If item already exists, fall through to the legacy addItem flow which handles
-    // existing-item upsert (uncheck if checked, update notes/qty). The new path is
-    // for fresh adds where we want to land in a custom category.
-    const existing = this.targetList.getItemByName(itemName);
-    if (existing) {
-      console.error(`Item "${itemName}" already exists; falling back to upsert without category change.`);
-      return this.addItem(itemName, quantity, notes, 'other');
-    }
-
     // Compute the right matchId: copy from sibling, fall back to systemCategory, then slug-of-name.
     let matchId;
     const sibling = this.targetList.items.find(i =>
@@ -295,6 +298,37 @@ class AnyListClient {
     if (sibling) matchId = sibling._categoryMatchId;
     else if (category.systemCategory) matchId = category.systemCategory;
     else matchId = String(category.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+
+    // Duplicate handling is scoped to the TARGET category, not the whole list.
+    // AnyList genuinely supports two items with the same name in different
+    // categories (verified against a live account), which is the point of a
+    // per-aisle setup: "cheese" in both "Aisle 15: Cheese" and "Deli". Checking
+    // the whole list would silently upsert the existing item and leave it in
+    // its original category while reporting success for the requested one.
+    //
+    // Within the target category, a repeat add is still an upsert, so adding
+    // the same item twice to one category does not create duplicates.
+    const belongsToTarget = (item) => {
+      const assignments = item.categoryAssignments || [];
+      // Explicit assignments are authoritative when present; items created by
+      // the plain addItem path only carry a matchId, so fall back to that.
+      if (assignments.length > 0) {
+        return assignments.some(a => a.categoryId === category.identifier);
+      }
+      return item._categoryMatchId === matchId;
+    };
+
+    const existingInCategory = this.targetList.items.find(
+      i => i.name === itemName && belongsToTarget(i)
+    );
+    if (existingInCategory) {
+      console.error(`Item "${itemName}" already exists in category "${category.name}"; updating in place.`);
+      if (existingInCategory.checked) existingInCategory.checked = false;
+      existingInCategory.quantity = quantity;
+      if (notes !== null) existingInCategory.details = notes;
+      await existingInCategory.save();
+      return existingInCategory;
+    }
 
     const itemOptions = {
       name: itemName,
