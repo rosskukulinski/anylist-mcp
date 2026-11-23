@@ -150,9 +150,33 @@ class AnyListClient {
       return true;
 
     } catch (error) {
+      // Never keep a half-initialised session. If login() or getLists() failed
+      // (e.g. a 429 from AnyList), this.client is set but holds no lists, and
+      // because the next connect() only checks `this.client` it would skip
+      // re-authenticating and report every list as "not found" until the
+      // process restarts. Drop it so the next call starts a clean login.
+      // An empty list cache means the same thing even on an older client.
+      this.targetList = null;
+      if (!this.client?.lists?.length) {
+        this._resetClient();
+      }
       const wrappedError = new Error(`Failed to connect to AnyList: ${error.message}`);
       console.error(wrappedError.message);
       throw wrappedError;
+    }
+  }
+
+  /** Discard the current AnyList session (closing its websocket) without throwing. */
+  _resetClient() {
+    const stale = this.client;
+    this.client = null;
+    this.targetList = null;
+    if (stale) {
+      try {
+        stale.teardown();
+      } catch {
+        // Best effort: the session is already unusable.
+      }
     }
   }
 
